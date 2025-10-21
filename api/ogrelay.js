@@ -178,21 +178,29 @@ async function tryOEmbed(postUrl) {
   } catch { return null; }
 }
 
+// --- Resilient HTML fetch that NEVER throws; it returns placeholder on errors ---
 async function fetchHtml(url) {
-  const res = await fetch(url, {
-    method: "GET",
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-      "Accept-Language": "en-US,en;q=0.8",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    },
-  });
-  if (!res.ok) {
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      },
+    });
+    if (!res.ok) {
+      // Non-200: treat as empty so pipeline can continue to next fallback
+      return "<html><head><title>Instagram</title></head><body>Instagram</body></html>";
+    }
+    return await res.text();
+  } catch {
+    // Network/timeout/other fetch error: return placeholder instead of throwing
     return "<html><head><title>Instagram</title></head><body>Instagram</body></html>";
   }
-  return await res.text();
 }
+
 
 async function fetchViaScrapingBee(url, key) {
   const api = new URL("https://app.scrapingbee.com/api/v1/");
