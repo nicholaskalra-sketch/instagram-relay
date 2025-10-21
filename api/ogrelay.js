@@ -229,9 +229,28 @@ function extractOgAndText(html = "") {
   return { ogTitle, ogDesc, ogImage, text };
 }
 
+// Treat Instagram login wall / boilerplate as NOT useful so we fall through to Bee
+function isLoginWall(text = "") {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  return (
+    t.includes("log into instagram") ||
+    t.startsWith("title: instagram") ||
+    t.includes("mobile number, username or email") ||
+    t.includes("create new account") ||
+    t.includes("password reset") ||
+    t.includes("© 2025 instagram from meta")
+  );
+}
+
 function hasUseful(parsed) {
   if (!parsed) return false;
   if (parsed.ogTitle || parsed.ogDesc) return true;
-  if (parsed.text && parsed.text !== "Instagram") return true;
+  if (parsed.text) {
+    const trimmed = parsed.text.trim();
+    // Ignore generic “Instagram” and login-wall flavored pages
+    if (trimmed.length > 50 && !isLoginWall(trimmed)) return true;
+  }
   return false;
 }
+
