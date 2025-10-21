@@ -1,8 +1,11 @@
 // api/ogrelay.js
-// Instagram OG relay with CORS and robust fallbacks.
+// Instagram OG relay with CORS, robust fallbacks, and debug controls.
 // Order: (1) oEmbed, (2) direct HTML, (3) r.jina.ai mirror,
-// (4) ddinstagram, (5) ddinstagram via r.jina.ai, (6) ScrapingBee JS-render.
-// Returns: { ok, ogTitle, ogDesc, ogImage, text, source }
+// (4) ddinstagram, (5) ddinstagram via r.jina.ai, (6) ScrapingBee JS-render (if SCRAPINGBEE_KEY set).
+// Query params:
+//   url=<postUrl>           (required)
+//   force=bee               (optional, forces ScrapingBee step for testing)
+//   debug=1                 (optional, returns debug flags)
 
 export default async function handler(req, res) {
   // ---- CORS ----
@@ -12,27 +15,62 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(204).end();
 
   const raw = (req.query.url || "").toString().trim();
+  const force = (req.query.force || "").toString().trim();
+  const debugFlag = (req.query.debug || "").toString().trim() === "1";
+
   if (!/^https?:\/\//i.test(raw) || !/instagram\.com\//i.test(raw)) {
     return res.status(400).json({ error: "Provide a valid Instagram post URL." });
   }
   const target = normalizeIgUrl(raw);
+  const beeKey = process.env.SCRAPINGBEE_KEY || "";
 
   try {
+    // Fast test path: force ScrapingBee to verify env var works
+    if (force === "bee") {
+      if (!beeKey) {
+        return res.status(200).json({
+          ok: true, ogTitle: "", ogDesc: "", ogImage: "", text: "Bee key missing", source: "force-no-key",
+          debug: debugFlag ? { beeEnabled: false } : undefined
+        });
+      }
+      const beeHtml = await fetchViaScrapingBee(target, beeKey);
+      const parsed = extractOgAndText(beeHtml);
+      return res.status(200).json({
+        ok: true, ...parsed, source: "scrapingbee-forced",
+        debug: debugFlag ? { beeEnabled: true } : undefined
+      });
+    }
+
     // 1) oEmbed
     const fromOEmbed = await tryOEmbed(target);
-    if (fromOEmbed) return res.status(200).json({ ...fromOEmbed, source: "oembed" });
+    if (fromOEmbed) {
+      return res.status(200).json({
+        ...fromOEmbed, source: "oembed",
+        debug: debugFlag ? { beeEnabled: !!beeKey } : undefined
+      });
+    }
 
     // 2) Direct HTML
     let html = await fetchHtml(target);
     let parsed = extractOgAndText(html);
-    if (hasUseful(parsed)) return res.status(200).json({ ok: true, ...parsed, source: "html" });
+    if (hasUseful(parsed)) {
+      return res.status(200).json({
+        ok: true, ...parsed, source: "html",
+        debug: debugFlag ? { beeEnabled: !!beeKey } : undefined
+      });
+    }
 
-    // 3) r.jina.ai (http/https)
+    // 3) r.jina.ai mirrors
     const hostAndPath = target.replace(/^https?:\/\//i, "");
     for (const m of [`https://r.jina.ai/http://${hostAndPath}`, `https://r.jina.ai/https://${hostAndPath}`]) {
       html = await fetchHtml(m);
       parsed = extractOgAndText(html);
-      if (hasUseful(parsed)) return res.status(200).json({ ok: true, ...parsed, source: "mirror" });
+      if (hasUseful(parsed)) {
+        return res.status(200).json({
+          ok: true, ...parsed, source: "mirror",
+          debug: debugFlag ? { beeEnabled: !!beeKey } : undefined
+        });
+      }
     }
 
     // 4) ddinstagram
@@ -40,7 +78,12 @@ export default async function handler(req, res) {
     if (ddUrl) {
       html = await fetchHtml(ddUrl);
       parsed = extractOgAndText(html);
-      if (hasUseful(parsed)) return res.status(200).json({ ok: true, ...parsed, source: "ddinstagram" });
+      if (hasUseful(parsed)) {
+        return res.status(200).json({
+          ok: true, ...parsed, source: "ddinstagram",
+          debug: debugFlag ? { beeEnabled: !!beeKey } : undefined
+        });
+      }
     }
 
     // 5) ddinstagram via r.jina.ai
@@ -49,31 +92,41 @@ export default async function handler(req, res) {
       for (const m of [`https://r.jina.ai/http://${ddHostPath}`, `https://r.jina.ai/https://${ddHostPath}`]) {
         html = await fetchHtml(m);
         parsed = extractOgAndText(html);
-        if (hasUseful(parsed)) return res.status(200).json({ ok: true, ...parsed, source: "dd-mirror" });
+        if (hasUseful(parsed)) {
+          return res.status(200).json({
+            ok: true, ...parsed, source: "dd-mirror",
+            debug: debugFlag ? { beeEnabled: !!beeKey } : undefined
+          });
+        }
       }
     }
 
-    // 6) ScrapingBee JS-render fallback (requires env var SCRAPINGBEE_KEY)
-    if (process.env.SCRAPINGBEE_KEY) {
-      const beeHtml = await fetchViaScrapingBee(target, process.env.SCRAPINGBEE_KEY);
+    // 6) ScrapingBee JS-render fallback
+    if (beeKey) {
+      const beeHtml = await fetchViaScrapingBee(target, beeKey);
       parsed = extractOgAndText(beeHtml);
       if (hasUseful(parsed)) {
-        return res.status(200).json({ ok: true, ...parsed, source: "scrapingbee" });
+        return res.status(200).json({
+          ok: true, ...parsed, source: "scrapingbee",
+          debug: debugFlag ? { beeEnabled: true } : undefined
+        });
       }
-
-      // Also try ddinstagram through ScrapingBee (sometimes better)
       if (ddUrl) {
-        const beeDd = await fetchViaScrapingBee(ddUrl, process.env.SCRAPINGBEE_KEY);
+        const beeDd = await fetchViaScrapingBee(ddUrl, beeKey);
         parsed = extractOgAndText(beeDd);
         if (hasUseful(parsed)) {
-          return res.status(200).json({ ok: true, ...parsed, source: "scrapingbee-dd" });
+          return res.status(200).json({
+            ok: true, ...parsed, source: "scrapingbee-dd",
+            debug: debugFlag ? { beeEnabled: true } : undefined
+          });
         }
       }
     }
 
     // Still nothing useful
     return res.status(200).json({
-      ok: true, ogTitle: "", ogDesc: "", ogImage: "", text: "Instagram", source: "empty"
+      ok: true, ogTitle: "", ogDesc: "", ogImage: "", text: "Instagram", source: "empty",
+      debug: debugFlag ? { beeEnabled: !!beeKey } : undefined
     });
   } catch (e) {
     return res.status(500).json({ error: e?.message || "Relay error" });
@@ -146,10 +199,11 @@ async function fetchViaScrapingBee(url, key) {
   api.searchParams.set("api_key", key);
   api.searchParams.set("url", url);
   api.searchParams.set("render_js", "true");
-  api.searchParams.set("country_code", "US"); // optional; can try "GB" etc.
-  // You can add: api.searchParams.set("block_resources","false"); to allow images/CSS if needed.
+  api.searchParams.set("country_code", "US");
   const res = await fetch(api.toString(), { method: "GET" });
-  if (!res.ok) return "<html><body>Instagram</body></html>";
+  if (!res.ok) {
+    return "<html><body>Instagram</body></html>";
+  }
   return await res.text();
 }
 
