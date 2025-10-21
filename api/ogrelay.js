@@ -1,6 +1,7 @@
 // api/ogrelay.js
-// Instagram OG relay with CORS. Tries (1) oEmbed, (2) direct HTML, (3) r.jina.ai mirror,
-// (4) ddinstagram mirror, (5) ddinstagram via r.jina.ai.
+// Instagram OG relay with CORS and robust fallbacks.
+// Order: (1) oEmbed, (2) direct HTML, (3) r.jina.ai mirror,
+// (4) ddinstagram, (5) ddinstagram via r.jina.ai, (6) ScrapingBee JS-render.
 // Returns: { ok, ogTitle, ogDesc, ogImage, text, source }
 
 export default async function handler(req, res) {
@@ -10,7 +11,6 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  // ---- Validate input ----
   const raw = (req.query.url || "").toString().trim();
   if (!/^https?:\/\//i.test(raw) || !/instagram\.com\//i.test(raw)) {
     return res.status(400).json({ error: "Provide a valid Instagram post URL." });
@@ -25,58 +25,55 @@ export default async function handler(req, res) {
     // 2) Direct HTML
     let html = await fetchHtml(target);
     let parsed = extractOgAndText(html);
-    if (hasUseful(parsed)) {
-      return res.status(200).json({ ok: true, ...parsed, source: "html" });
-    }
+    if (hasUseful(parsed)) return res.status(200).json({ ok: true, ...parsed, source: "html" });
 
-    // 3) r.jina.ai mirror (http, https)
+    // 3) r.jina.ai (http/https)
     const hostAndPath = target.replace(/^https?:\/\//i, "");
-    const mirrors = [
-      `https://r.jina.ai/http://${hostAndPath}`,
-      `https://r.jina.ai/https://${hostAndPath}`,
-    ];
-    for (const m of mirrors) {
+    for (const m of [`https://r.jina.ai/http://${hostAndPath}`, `https://r.jina.ai/https://${hostAndPath}`]) {
       html = await fetchHtml(m);
       parsed = extractOgAndText(html);
-      if (hasUseful(parsed)) {
-        return res.status(200).json({ ok: true, ...parsed, source: "mirror" });
-      }
+      if (hasUseful(parsed)) return res.status(200).json({ ok: true, ...parsed, source: "mirror" });
     }
 
-    // 4) ddinstagram mirror (construct from original /p/ or /reel/ path)
-    const ddUrl = toDdInstagram(target);          // e.g., https://ddinstagram.com/p/abc123/
+    // 4) ddinstagram
+    const ddUrl = toDdInstagram(target);
     if (ddUrl) {
       html = await fetchHtml(ddUrl);
       parsed = extractOgAndText(html);
-      if (hasUseful(parsed)) {
-        return res.status(200).json({ ok: true, ...parsed, source: "ddinstagram" });
+      if (hasUseful(parsed)) return res.status(200).json({ ok: true, ...parsed, source: "ddinstagram" });
+    }
+
+    // 5) ddinstagram via r.jina.ai
+    if (ddUrl) {
+      const ddHostPath = ddUrl.replace(/^https?:\/\//i, "");
+      for (const m of [`https://r.jina.ai/http://${ddHostPath}`, `https://r.jina.ai/https://${ddHostPath}`]) {
+        html = await fetchHtml(m);
+        parsed = extractOgAndText(html);
+        if (hasUseful(parsed)) return res.status(200).json({ ok: true, ...parsed, source: "dd-mirror" });
       }
     }
 
-    // 5) ddinstagram via r.jina.ai (http/https)
-    if (ddUrl) {
-      const ddHostPath = ddUrl.replace(/^https?:\/\//i, "");
-      const ddMirrors = [
-        `https://r.jina.ai/http://${ddHostPath}`,
-        `https://r.jina.ai/https://${ddHostPath}`,
-      ];
-      for (const m of ddMirrors) {
-        html = await fetchHtml(m);
-        parsed = extractOgAndText(html);
+    // 6) ScrapingBee JS-render fallback (requires env var SCRAPINGBEE_KEY)
+    if (process.env.SCRAPINGBEE_KEY) {
+      const beeHtml = await fetchViaScrapingBee(target, process.env.SCRAPINGBEE_KEY);
+      parsed = extractOgAndText(beeHtml);
+      if (hasUseful(parsed)) {
+        return res.status(200).json({ ok: true, ...parsed, source: "scrapingbee" });
+      }
+
+      // Also try ddinstagram through ScrapingBee (sometimes better)
+      if (ddUrl) {
+        const beeDd = await fetchViaScrapingBee(ddUrl, process.env.SCRAPINGBEE_KEY);
+        parsed = extractOgAndText(beeDd);
         if (hasUseful(parsed)) {
-          return res.status(200).json({ ok: true, ...parsed, source: "dd-mirror" });
+          return res.status(200).json({ ok: true, ...parsed, source: "scrapingbee-dd" });
         }
       }
     }
 
-    // Nothing useful anywhere
+    // Still nothing useful
     return res.status(200).json({
-      ok: true,
-      ogTitle: "",
-      ogDesc: "",
-      ogImage: "",
-      text: "Instagram",
-      source: "empty"
+      ok: true, ogTitle: "", ogDesc: "", ogImage: "", text: "Instagram", source: "empty"
     });
   } catch (e) {
     return res.status(500).json({ error: e?.message || "Relay error" });
@@ -86,11 +83,9 @@ export default async function handler(req, res) {
 // ---------- helpers ----------
 
 function normalizeIgUrl(u) {
-  let https = u.replace(/^http:\/\//i, "https://");
-  https = https.replace(/<|>/g, "");
+  let https = u.replace(/^http:\/\//i, "https://").replace(/<|>/g, "");
   try {
     const url = new URL(https);
-    // Ensure trailing slash for /p/ or /reel/ paths (helps some mirrors)
     if ((/\/p\/[^/]+$/.test(url.pathname) || /\/reel\/[^/]+$/.test(url.pathname)) && !url.pathname.endsWith("/")) {
       url.pathname += "/";
       https = url.toString();
@@ -102,11 +97,8 @@ function normalizeIgUrl(u) {
 function toDdInstagram(igUrl) {
   try {
     const u = new URL(igUrl);
-    // Map instagram.com → ddinstagram.com (keep path/query)
     return `https://ddinstagram.com${u.pathname}${u.search || ""}`;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function tryOEmbed(postUrl) {
@@ -146,6 +138,18 @@ async function fetchHtml(url) {
   if (!res.ok) {
     return "<html><head><title>Instagram</title></head><body>Instagram</body></html>";
   }
+  return await res.text();
+}
+
+async function fetchViaScrapingBee(url, key) {
+  const api = new URL("https://app.scrapingbee.com/api/v1/");
+  api.searchParams.set("api_key", key);
+  api.searchParams.set("url", url);
+  api.searchParams.set("render_js", "true");
+  api.searchParams.set("country_code", "US"); // optional; can try "GB" etc.
+  // You can add: api.searchParams.set("block_resources","false"); to allow images/CSS if needed.
+  const res = await fetch(api.toString(), { method: "GET" });
+  if (!res.ok) return "<html><body>Instagram</body></html>";
   return await res.text();
 }
 
